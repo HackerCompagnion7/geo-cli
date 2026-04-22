@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# geo-cli — Geolocation CLI with real map rendering in terminal
+# geo-cli v2.0 — Geolocation CLI with real map rendering in terminal
 # Author: vertiljivenson
 # =============================================================================
 set -euo pipefail
@@ -15,12 +15,15 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
+# ─── Version ─────────────────────────────────────────────────────────────────
+VERSION="2.0.0"
+
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAP_FILE="${SCRIPT_DIR}/assets/world_map.png"
 MAP_URL="https://upload.wikimedia.org/wikipedia/commons/e/ea/Equirectangular-projection.jpg"
 
-# Use compatible temp dir (Termux uses $TMPDIR or /data/data/com.termux/files/usr/tmp)
+# Use compatible temp dir (Termux uses $TMPDIR)
 if [[ -n "${TMPDIR:-}" ]]; then
     _TMP_BASE="${TMPDIR}"
 elif [[ -d "/tmp" && -w "/tmp" ]]; then
@@ -31,27 +34,66 @@ fi
 TMP_DIR="$(mktemp -d "${_TMP_BASE}/geo-cli.XXXXXX")"
 MAP_WITH_PIN="${TMP_DIR}/map_pin.png"
 
+# ─── Flags ───────────────────────────────────────────────────────────────────
+FLAG_JSON=false
+FLAG_NO_MAP=false
+FLAG_VERBOSE=false
+FLAG_BATCH=false
+
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup() {
     rm -rf "${TMP_DIR}"
+    # Stop spinner if running
+    if [[ -n "${_SPINNER_PID:-}" ]]; then
+        kill "${_SPINNER_PID}" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
 # ─── Print helpers ───────────────────────────────────────────────────────────
-print_error() {
-    echo -e "${RED}Error:${RESET} $1" >&2
+print_error()   { echo -e "  ${RED}✗${RESET} $1" >&2; }
+print_success() { echo -e "  ${GREEN}✓${RESET} $1"; }
+print_warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
+print_info()    { echo -e "  ${CYAN}→${RESET} $1"; }
+
+# ─── Spinner ─────────────────────────────────────────────────────────────────
+_spinner_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+_spinner_msg=""
+
+start_spinner() {
+    _spinner_msg="$1"
+    _SPINNER_PID=""
+    if [[ -t 1 ]]; then
+        (
+            i=0
+            while true; do
+                printf "\r  ${CYAN}%s${RESET} %s" "${_spinner_frames[$((i % ${#_spinner_frames[@]}))]}" "${_spinner_msg}"
+                i=$((i + 1))
+                sleep 0.08
+            done
+        ) &
+        _SPINNER_PID=$!
+    else
+        echo -e "  ${CYAN}→${RESET} ${_spinner_msg}"
+    fi
 }
 
-print_info() {
-    echo -e "${CYAN}→${RESET} $1"
+stop_spinner() {
+    if [[ -n "${_SPINNER_PID:-}" ]] && kill -0 "${_SPINNER_PID}" 2>/dev/null; then
+        kill "${_SPINNER_PID}" 2>/dev/null || true
+        wait "${_SPINNER_PID}" 2>/dev/null || true
+        _SPINNER_PID=""
+        # Clear spinner line
+        printf "\r%*s\r" 60 ""
+    fi
 }
 
 # ─── Banner ──────────────────────────────────────────────────────────────────
 show_banner() {
     echo -e ""
-    echo -e "${BOLD}${CYAN}  ╔══════════════════════════════════════╗${RESET}"
-    echo -e "${BOLD}${CYAN}  ║${RESET}${BOLD}  geo-cli  ·  IP Geolocation Map      ${BOLD}${CYAN}║${RESET}"
-    echo -e "${BOLD}${CYAN}  ╚══════════════════════════════════════╝${RESET}"
+    echo -e "${BOLD}${CYAN}  ╔═══════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${CYAN}  ║${RESET}${BOLD}   geo-cli v${VERSION}  ·  IP Geolocation  ${BOLD}${CYAN}║${RESET}"
+    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════════════╝${RESET}"
     echo -e ""
 }
 
@@ -59,41 +101,45 @@ show_banner() {
 show_usage() {
     show_banner
     echo -e "  ${BOLD}Usage:${RESET}"
-    echo -e "    geo-cli <ip-address|domain>"
+    echo -e "    geo-cli <ip|domain> [options]"
+    echo -e "    geo-cli <file.txt>          Batch mode"
+    echo -e ""
+    echo -e "  ${BOLD}Options:${RESET}"
+    echo -e "    ${CYAN}--json${RESET}       Output raw JSON"
+    echo -e "    ${CYAN}--no-map${RESET}     Skip map rendering"
+    echo -e "    ${CYAN}--verbose${RESET}    Show extra details"
+    echo -e "    ${CYAN}-h, --help${RESET}   Show this help"
+    echo -e "    ${CYAN}-v, --version${RESET} Show version"
     echo -e ""
     echo -e "  ${BOLD}Examples:${RESET}"
     echo -e "    geo-cli 8.8.8.8"
-    echo -e "    geo-cli 1.1.1.1"
-    echo -e "    geo-cli google.com"
-    echo -e ""
-    echo -e "  ${BOLD}Options:${RESET}"
-    echo -e "    -h, --help     Show this help message"
-    echo -e "    -v, --version  Show version"
+    echo -e "    geo-cli google.com --verbose"
+    echo -e "    geo-cli 8.8.8.8 --json"
+    echo -e "    geo-cli ip_list.txt --no-map"
     echo -e ""
 }
-
-# ─── Version ─────────────────────────────────────────────────────────────────
-VERSION="1.0.0"
 
 # ─── Dependency check ────────────────────────────────────────────────────────
 check_deps() {
     local missing=()
 
-    # curl is mandatory
     if ! command -v curl &>/dev/null; then
         missing+=("curl")
     fi
 
-    # chafa is mandatory for terminal rendering
     if ! command -v chafa &>/dev/null; then
         missing+=("chafa")
     fi
 
-    # Either ImageMagick (convert) or Python3+Pillow is needed for pin drawing
     local has_image_tool=false
+    USE_IMAGEMAGICK=false
     if command -v convert &>/dev/null; then
         has_image_tool=true
         USE_IMAGEMAGICK=true
+    elif command -v magick &>/dev/null; then
+        has_image_tool=true
+        USE_IMAGEMAGICK=true
+        # Termux IM7 uses 'magick' not 'convert' — alias it
     elif command -v python3 &>/dev/null; then
         if python3 -c "from PIL import Image, ImageDraw" 2>/dev/null; then
             has_image_tool=true
@@ -101,7 +147,7 @@ check_deps() {
         fi
     fi
 
-    if ! ${has_image_tool}; then
+    if ! ${has_image_tool} && ! ${FLAG_NO_MAP}; then
         missing+=("imagemagick or python3-pillow")
     fi
 
@@ -135,7 +181,6 @@ ensure_map() {
             print_error "Failed to download map image."
             exit 1
         fi
-        # Resize to proper equirectangular dimensions
         if command -v convert &>/dev/null; then
             convert "${MAP_FILE}" -resize 2048x1024! "${MAP_FILE}.tmp" 2>/dev/null && \
                 mv "${MAP_FILE}.tmp" "${MAP_FILE}"
@@ -147,7 +192,6 @@ img = img.resize((2048, 1024), Image.LANCZOS)
 img.save('${MAP_FILE}', 'PNG')
 " 2>/dev/null
         fi
-        print_info "Map downloaded successfully."
     fi
 }
 
@@ -178,12 +222,16 @@ query_geo() {
     local ip="$1"
     local json
 
-    json=$(curl -s "http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,regionName,city,lat,lon,query,isp" 2>/dev/null)
+    # ip-api.com free tier — 45 requests/minute
+    json=$(curl -s "http://ip-api.com/json/${ip}?fields=status,message,continent,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query,proxy,hosting" 2>/dev/null)
 
     if [[ -z "${json}" ]]; then
         print_error "No response from geolocation API. Check your connection."
         exit 1
     fi
+
+    # Store raw JSON for --json mode
+    GEO_JSON="${json}"
 
     local status
     status=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
@@ -194,13 +242,22 @@ query_geo() {
         exit 1
     fi
 
+    # Parse all fields
     GEO_LAT=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lat',0))" 2>/dev/null || echo "0")
     GEO_LON=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lon',0))" 2>/dev/null || echo "0")
     GEO_COUNTRY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('country','Unknown'))" 2>/dev/null || echo "Unknown")
+    GEO_COUNTRY_CODE=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('countryCode',''))" 2>/dev/null || echo "")
+    GEO_CONTINENT=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('continent',''))" 2>/dev/null || echo "")
     GEO_CITY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('city',''))" 2>/dev/null || echo "")
     GEO_REGION=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('regionName',''))" 2>/dev/null || echo "")
+    GEO_ZIP=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('zip',''))" 2>/dev/null || echo "")
+    GEO_TIMEZONE=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('timezone',''))" 2>/dev/null || echo "")
     GEO_ISP=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('isp',''))" 2>/dev/null || echo "")
+    GEO_ORG=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('org',''))" 2>/dev/null || echo "")
+    GEO_AS=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('as',''))" 2>/dev/null || echo "")
     GEO_QUERY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('query',''))" 2>/dev/null || echo "")
+    GEO_PROXY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('proxy',False))" 2>/dev/null || echo "False")
+    GEO_HOSTING=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hosting',False))" 2>/dev/null || echo "False")
 }
 
 # ─── Draw pin on map (ImageMagick) ──────────────────────────────────────────
@@ -209,13 +266,17 @@ draw_pin_imagemagick() {
     local lon="${GEO_LON}"
     local map_width map_height
 
-    map_width=$(identify -format "%w" "${MAP_FILE}" 2>/dev/null || echo "2048")
-    map_height=$(identify -format "%h" "${MAP_FILE}" 2>/dev/null || echo "1024")
+    if command -v identify &>/dev/null; then
+        map_width=$(identify -format "%w" "${MAP_FILE}" 2>/dev/null || echo "2048")
+        map_height=$(identify -format "%h" "${MAP_FILE}" 2>/dev/null || echo "1024")
+    else
+        map_width=2048
+        map_height=1024
+    fi
 
     local x y
     x=$(python3 -c "print(int((${lon} + 180) / 360 * ${map_width}))")
     y=$(python3 -c "print(int((90 - ${lat}) / 180 * ${map_height}))")
-
     x=$(python3 -c "print(max(0, min(${x}, ${map_width} - 1)))")
     y=$(python3 -c "print(max(0, min(${y}, ${map_height} - 1)))")
 
@@ -227,19 +288,24 @@ draw_pin_imagemagick() {
     local ring_width=$((pin_size / 3))
     [[ ${ring_width} -lt 2 ]] && ring_width=2
 
-    convert "${MAP_FILE}" \
-        \( +clone -fill "rgba(255,0,0,0.25)" -draw "circle ${x},${y} $((x + ring_size)),${y}" \) \
+    local convert_cmd="convert"
+    if ! command -v convert &>/dev/null && command -v magick &>/dev/null; then
+        convert_cmd="magick"
+    fi
+
+    ${convert_cmd} "${MAP_FILE}" \
+        \( +clone -fill "rgba(255,60,60,0.3)" -draw "circle ${x},${y} $((x + ring_size)),${y}" \) \
         -compose over -composite \
-        -fill "none" -stroke "#FF0000" -strokewidth "${ring_width}" \
+        -fill "none" -stroke "#FF2020" -strokewidth "${ring_width}" \
         -draw "circle ${x},${y} $((x + pin_size)),${y}" \
-        -fill "#FF0000" -stroke none \
+        -fill "#FF2020" -stroke none \
         -draw "circle ${x},${y} $((x + pin_size / 2)),${y}" \
         -fill "#FFFFFF" -stroke none \
         -draw "circle ${x},${y} $((x + pin_size / 4)),${y}" \
         "${MAP_WITH_PIN}" 2>/dev/null
 }
 
-# ─── Draw pin on map (Pillow fallback) ────────────────────────────────────────
+# ─── Draw pin on map (Pillow fallback) ───────────────────────────────────────
 draw_pin_pillow() {
     local lat="${GEO_LAT}"
     local lon="${GEO_LON}"
@@ -248,7 +314,6 @@ draw_pin_pillow() {
 
     python3 -c "
 from PIL import Image, ImageDraw
-import math
 
 lat = ${lat}
 lon = ${lon}
@@ -256,11 +321,8 @@ lon = ${lon}
 img = Image.open('${map_file}')
 map_width, map_height = img.size
 
-# Equirectangular projection
 x = int((lon + 180) / 360 * map_width)
 y = int((90 - lat) / 180 * map_height)
-
-# Clamp to image bounds
 x = max(0, min(x, map_width - 1))
 y = max(0, min(y, map_height - 1))
 
@@ -271,26 +333,25 @@ ring_width = max(2, pin_size // 3)
 overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
 draw = ImageDraw.Draw(overlay)
 
-# Outer glow (semi-transparent red)
-for i in range(3, 0, -1):
-    alpha = int(30 / i)
-    r = ring_size + i * 3
-    draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 0, 0, alpha))
+# Outer glow
+for i in range(4, 0, -1):
+    alpha = int(25 / i)
+    r = ring_size + i * 4
+    draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 40, 40, alpha))
 
 # Red ring
 for w in range(ring_width):
     r = pin_size + w
-    draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 0, 0, 255))
+    draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 32, 32, 255))
 
 # Solid red center
 draw.ellipse([x - pin_size // 2, y - pin_size // 2, x + pin_size // 2, y + pin_size // 2],
-             fill=(255, 0, 0, 255))
+             fill=(255, 32, 32, 255))
 
 # White inner dot
 dot_r = pin_size // 4
 draw.ellipse([x - dot_r, y - dot_r, x + dot_r, y + dot_r], fill=(255, 255, 255, 255))
 
-# Composite onto original
 if img.mode != 'RGBA':
     img = img.convert('RGBA')
 result = Image.alpha_composite(img, overlay)
@@ -298,9 +359,9 @@ result.save('${output}', 'PNG')
 " 2>/dev/null
 }
 
-# ─── Draw pin on map (dispatcher) ────────────────────────────────────────────
+# ─── Draw pin (dispatcher) ──────────────────────────────────────────────────
 draw_pin() {
-    if ${USE_IMAGEMAGICK:-false}; then
+    if ${USE_IMAGEMAGICK}; then
         draw_pin_imagemagick
     else
         draw_pin_pillow
@@ -321,16 +382,39 @@ render_map() {
     [[ ${chafa_width} -lt 40 ]] && chafa_width=40
     [[ ${chafa_width} -gt 200 ]] && chafa_width=200
 
-    chafa "${MAP_WITH_PIN}" \
-        --size="${chafa_width}x" \
-        --symbols block+half+vhalf+space \
-        --colors 256 \
-        --dither ordered \
-        --optimize 9 \
-        2>/dev/null
+    # Use sixel if available (much higher quality), else symbols
+    if chafa -f sixels "${MAP_WITH_PIN}" --size=1x1 2>/dev/null | head -1 | grep -q .; then
+        chafa "${MAP_WITH_PIN}" \
+            --format sixels \
+            --size="${chafa_width}x" \
+            --optimize 9 \
+            2>/dev/null
+    else
+        chafa "${MAP_WITH_PIN}" \
+            --size="${chafa_width}x" \
+            --symbols block+half+vhalf+space \
+            --colors 256 \
+            --dither ordered \
+            --optimize 9 \
+            2>/dev/null
+    fi
 }
 
-# ─── Display results ────────────────────────────────────────────────────────
+# ─── Format coordinate ──────────────────────────────────────────────────────
+format_coord() {
+    local value="$1"
+    local pos_dir="$2"
+    local neg_dir="$3"
+    local abs_val
+    abs_val=$(python3 -c "print(abs(${value}))")
+    if python3 -c "exit(0 if ${value} < 0 else 1)" 2>/dev/null; then
+        echo "${abs_val}°${neg_dir}"
+    else
+        echo "${abs_val}°${pos_dir}"
+    fi
+}
+
+# ─── Display results (normal mode) ─────────────────────────────────────────
 display_results() {
     local location_parts=()
     [[ -n "${GEO_CITY}" ]] && location_parts+=("${GEO_CITY}")
@@ -339,72 +423,203 @@ display_results() {
     local location
     location=$(IFS=, ; echo "${location_parts[*]}" | sed 's/,/, /g')
 
-    local lat_dir="N" lon_dir="E"
-    python3 -c "exit(0 if ${GEO_LAT} < 0 else 1)" 2>/dev/null && lat_dir="S"
-    python3 -c "exit(0 if ${GEO_LON} < 0 else 1)" 2>/dev/null && lon_dir="W"
+    local lat_str lon_str
+    lat_str=$(format_coord "${GEO_LAT}" "N" "S")
+    lon_str=$(format_coord "${GEO_LON}" "E" "W")
 
-    local lat_abs lon_abs
-    lat_abs=$(python3 -c "print(abs(${GEO_LAT}))")
-    lon_abs=$(python3 -c "print(abs(${GEO_LON}))")
+    # Flag emoji from country code
+    local flag=""
+    if [[ -n "${GEO_COUNTRY_CODE}" ]]; then
+        flag=$(python3 -c "
+code = '${GEO_COUNTRY_CODE}'
+try:
+    flag = ''.join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code)
+    print(flag)
+except:
+    print('')
+" 2>/dev/null || echo "")
+    fi
+
+    # Connection type badge
+    local conn_badge=""
+    if [[ "${GEO_PROXY}" == "True" ]]; then
+        conn_badge="${RED}PROXY${RESET}"
+    elif [[ "${GEO_HOSTING}" == "True" ]]; then
+        conn_badge="${YELLOW}HOSTING${RESET}"
+    else
+        conn_badge="${GREEN}RESIDENTIAL${RESET}"
+    fi
 
     echo -e ""
-    echo -e "  ${BOLD}┌─────────────────────────────────────────────┐${RESET}"
-    echo -e "  ${BOLD}│${RESET}  ${WHITE}IP:${RESET}          ${GREEN}${GEO_QUERY}${RESET}"
-    echo -e "  ${BOLD}│${RESET}  ${WHITE}Location:${RESET}    ${GREEN}${location}${RESET}"
-    echo -e "  ${BOLD}│${RESET}  ${WHITE}Coordinates:${RESET} ${GREEN}${lat_abs}°${lat_dir}, ${lon_abs}°${lon_dir}${RESET}"
-    if [[ -n "${GEO_ISP}" ]]; then
-        echo -e "  ${BOLD}│${RESET}  ${WHITE}ISP:${RESET}        ${DIM}${GEO_ISP}${RESET}"
+    echo -e "  ${BOLD}┌──────────────────────────────────────────────────┐${RESET}"
+    echo -e "  ${BOLD}│${RESET}                                                  ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}IP${RESET}            ${GREEN}${GEO_QUERY}${RESET} $([ -n "${flag}" ] && echo "${flag}")"
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}Location${RESET}      ${GREEN}${location}${RESET}"
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}Coordinates${RESET}   ${GREEN}${lat_str}, ${lon_str}${RESET}"
+    if [[ -n "${GEO_TIMEZONE}" ]]; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}Timezone${RESET}      ${GREEN}${GEO_TIMEZONE}${RESET}"
     fi
-    echo -e "  ${BOLD}└─────────────────────────────────────────────┘${RESET}"
+    if [[ -n "${GEO_ZIP}" ]] && ${FLAG_VERBOSE}; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}ZIP${RESET}           ${GREEN}${GEO_ZIP}${RESET}"
+    fi
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}Connection${RESET}    ${conn_badge}"
+    if [[ -n "${GEO_ISP}" ]]; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}ISP${RESET}           ${DIM}${GEO_ISP}${RESET}"
+    fi
+    if ${FLAG_VERBOSE} && [[ -n "${GEO_ORG}" ]]; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}Organization${RESET}  ${DIM}${GEO_ORG}${RESET}"
+    fi
+    if ${FLAG_VERBOSE} && [[ -n "${GEO_AS}" ]]; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}AS${RESET}            ${DIM}${GEO_AS}${RESET}"
+    fi
+    if ${FLAG_VERBOSE} && [[ -n "${GEO_CONTINENT}" ]]; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}Continent${RESET}     ${GREEN}${GEO_CONTINENT}${RESET}"
+    fi
+    echo -e "  ${BOLD}│${RESET}                                                  ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}└──────────────────────────────────────────────────┘${RESET}"
     echo -e ""
 }
 
-# ─── Main ────────────────────────────────────────────────────────────────────
-main() {
-    case "${1:-}" in
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        -v|--version)
-            echo "geo-cli v${VERSION}"
-            exit 0
-            ;;
-        "")
-            print_error "No IP address or domain provided."
-            show_usage
-            exit 1
-            ;;
-    esac
+# ─── Display results (JSON mode) ───────────────────────────────────────────
+display_json() {
+    echo "${GEO_JSON}" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+print(json.dumps(data, indent=2, ensure_ascii=False))
+" 2>/dev/null || echo "${GEO_JSON}"
+}
 
+# ─── Process single IP ──────────────────────────────────────────────────────
+process_ip() {
     local input="$1"
+    local original_input="${input}"
 
-    show_banner
-    check_deps
     validate_input "${input}"
 
     local ip
     ip=$(resolve_ip "${input}")
     if [[ "${input}" != "${ip}" ]]; then
-        print_info "Resolved ${input} → ${ip}"
+        ${FLAG_VERBOSE} && print_info "Resolved ${input} → ${ip}"
     fi
 
-    print_info "Querying geolocation..."
+    start_spinner "Querying ${ip}..."
     query_geo "${ip}"
+    stop_spinner
 
-    ensure_map
+    # --json mode: just output JSON and done
+    if ${FLAG_JSON}; then
+        display_json
+        return
+    fi
 
-    print_info "Rendering map..."
-    draw_pin
+    # Ensure map exists
+    if ! ${FLAG_NO_MAP}; then
+        ensure_map
+    fi
 
-    clear 2>/dev/null || true
+    # Draw pin on map
+    if ! ${FLAG_NO_MAP}; then
+        start_spinner "Rendering map..."
+        draw_pin
+        stop_spinner
+    fi
 
-    show_banner
+    # Clear screen for clean presentation (not in batch/verbose)
+    if ! ${FLAG_BATCH} && ! ${FLAG_VERBOSE}; then
+        clear 2>/dev/null || true
+    fi
+
+    # Display header
+    if ! ${FLAG_BATCH}; then
+        show_banner
+    fi
+
+    # Display results
     display_results
 
-    render_map
+    # Render map
+    if ! ${FLAG_NO_MAP}; then
+        render_map
+    fi
 
-    echo -e ""
+    if ${FLAG_BATCH}; then
+        echo -e "  ${DIM}─────────────────────────────────────────${RESET}"
+    else
+        echo -e ""
+    fi
+}
+
+# ─── Parse arguments ────────────────────────────────────────────────────────
+parse_args() {
+    local input_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "geo-cli v${VERSION}"
+                exit 0
+                ;;
+            --json)
+                FLAG_JSON=true
+                shift
+                ;;
+            --no-map)
+                FLAG_NO_MAP=true
+                shift
+                ;;
+            --verbose)
+                FLAG_VERBOSE=true
+                shift
+                ;;
+            *)
+                input_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#input_args[@]} -eq 0 ]]; then
+        print_error "No IP address, domain, or file provided."
+        show_usage
+        exit 1
+    fi
+
+    INPUT_ARGS=("${input_args[@]}")
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+
+    show_banner
+    check_deps
+
+    local first_input="${INPUT_ARGS[0]}"
+
+    # Check if input is a file (batch mode)
+    if [[ -f "${first_input}" ]]; then
+        FLAG_BATCH=true
+        print_info "Batch mode: processing ${first_input}"
+        echo -e ""
+
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            # Skip empty lines and comments
+            [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+            # Trim whitespace
+            line=$(echo "${line}" | xargs)
+            [[ -z "${line}" ]] && continue
+
+            process_ip "${line}"
+        done < "${first_input}"
+
+    else
+        # Single IP / domain
+        process_ip "${first_input}"
+    fi
 }
 
 main "$@"
