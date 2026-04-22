@@ -19,7 +19,16 @@ RESET='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAP_FILE="${SCRIPT_DIR}/assets/world_map.png"
 MAP_URL="https://upload.wikimedia.org/wikipedia/commons/e/ea/Equirectangular-projection.jpg"
-TMP_DIR="$(mktemp -d /tmp/geo-cli.XXXXXX)"
+
+# Use compatible temp dir (Termux uses $TMPDIR or /data/data/com.termux/files/usr/tmp)
+if [[ -n "${TMPDIR:-}" ]]; then
+    _TMP_BASE="${TMPDIR}"
+elif [[ -d "/tmp" && -w "/tmp" ]]; then
+    _TMP_BASE="/tmp"
+else
+    _TMP_BASE="${SCRIPT_DIR}"
+fi
+TMP_DIR="$(mktemp -d "${_TMP_BASE}/geo-cli.XXXXXX")"
 MAP_WITH_PIN="${TMP_DIR}/map_pin.png"
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────

@@ -22,10 +22,13 @@ print_info() { echo -e "  ${CYAN}→${RESET} $1"; }
 
 # ─── Detect package manager ─────────────────────────────────────────────────
 detect_pkg_manager() {
-    if command -v apt-get &>/dev/null; then
-        echo "apt"
-    elif command -v pkg &>/dev/null; then
+    # Termux MUST be checked first — it has apt-get but NO sudo
+    if command -v pkg &>/dev/null; then
         echo "termux"
+    elif [[ -n "${TERMUX_VERSION:-}" ]] || [[ -d "/data/data/com.termux" ]]; then
+        echo "termux"
+    elif command -v apt-get &>/dev/null; then
+        echo "apt"
     elif command -v dnf &>/dev/null; then
         echo "dnf"
     elif command -v yum &>/dev/null; then
@@ -48,12 +51,12 @@ install_pkg() {
     local pkgs=("$@")
 
     case "${pkg_mgr}" in
+        termux)
+            pkg install -y "${pkgs[@]}"
+            ;;
         apt)
             sudo apt-get update -qq
             sudo apt-get install -y -qq "${pkgs[@]}"
-            ;;
-        termux)
-            pkg install -y "${pkgs[@]}"
             ;;
         dnf)
             sudo dnf install -y "${pkgs[@]}"
@@ -183,14 +186,19 @@ main() {
         chafa_tmp="$(mktemp -d /tmp/chafa-build.XXXXXX)"
 
         if command -v git &>/dev/null && command -v gcc &>/dev/null && command -v make &>/dev/null; then
+            # Determine install prefix based on environment
+            local install_prefix="/usr/local"
+            if [[ -n "${TERMUX_VERSION:-}" ]] || [[ -d "/data/data/com.termux" ]]; then
+                install_prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+            fi
             (
                 cd "${chafa_tmp}"
                 git clone https://github.com/hpjansson/chafa.git 2>/dev/null
                 cd chafa
-                ./autogen.sh --prefix=/usr/local 2>/dev/null || true
-                ./configure --prefix=/usr/local 2>/dev/null || true
+                ./autogen.sh --prefix="${install_prefix}" 2>/dev/null || true
+                ./configure --prefix="${install_prefix}" 2>/dev/null || true
                 make -j"$(nproc 2>/dev/null || echo 2)" 2>/dev/null
-                sudo make install 2>/dev/null || true
+                make install DESTDIR= 2>/dev/null || sudo make install 2>/dev/null || true
             ) || true
         fi
 
@@ -217,11 +225,18 @@ main() {
         if curl -sL -o "${SCRIPT_DIR}/assets/world_map.png" \
             "https://upload.wikimedia.org/wikipedia/commons/e/ea/Equirectangular-projection.jpg" \
             -H "User-Agent: Mozilla/5.0"; then
-            # Resize to proper equirectangular dimensions if ImageMagick available
+            # Resize to proper equirectangular dimensions
             if command -v convert &>/dev/null; then
                 convert "${SCRIPT_DIR}/assets/world_map.png" -resize 2048x1024! \
                     "${SCRIPT_DIR}/assets/world_map.png.tmp" 2>/dev/null && \
                     mv "${SCRIPT_DIR}/assets/world_map.png.tmp" "${SCRIPT_DIR}/assets/world_map.png"
+            elif command -v python3 &>/dev/null; then
+                python3 -c "
+from PIL import Image
+img = Image.open('${SCRIPT_DIR}/assets/world_map.png')
+img = img.resize((2048, 1024), Image.LANCZOS)
+img.save('${SCRIPT_DIR}/assets/world_map.png', 'PNG')
+" 2>/dev/null
             fi
             print_ok "World map downloaded"
         else
