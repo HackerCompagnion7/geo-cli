@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# =============================================================================
+# geo-cli — Geolocation CLI with real map rendering in terminal
+# Author: vertiljivenson
+# =============================================================================
+set -euo pipefail
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAP_FILE="${SCRIPT_DIR}/assets/world_map.png"
+MAP_URL="https://upload.wikimedia.org/wikipedia/commons/e/ea/Equirectangular-projection.jpg"
+TMP_DIR="$(mktemp -d /tmp/geo-cli.XXXXXX)"
+MAP_WITH_PIN="${TMP_DIR}/map_pin.png"
+
+# ─── Cleanup ─────────────────────────────────────────────────────────────────
+cleanup() {
+    rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
+
+# ─── Print helpers ───────────────────────────────────────────────────────────
+print_error() {
+    echo -e "${RED}Error:${RESET} $1" >&2
+}
+
+print_info() {
+    echo -e "${CYAN}→${RESET} $1"
+}
+
+# ─── Banner ──────────────────────────────────────────────────────────────────
+show_banner() {
+    echo -e ""
+    echo -e "${BOLD}${CYAN}  ╔══════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${CYAN}  ║${RESET}${BOLD}  geo-cli  ·  IP Geolocation Map      ${BOLD}${CYAN}║${RESET}"
+    echo -e "${BOLD}${CYAN}  ╚══════════════════════════════════════╝${RESET}"
+    echo -e ""
+}
+
+# ─── Usage ───────────────────────────────────────────────────────────────────
+show_usage() {
+    show_banner
+    echo -e "  ${BOLD}Usage:${RESET}"
+    echo -e "    geo-cli <ip-address|domain>"
+    echo -e ""
+    echo -e "  ${BOLD}Examples:${RESET}"
+    echo -e "    geo-cli 8.8.8.8"
+    echo -e "    geo-cli 1.1.1.1"
+    echo -e "    geo-cli google.com"
+    echo -e ""
+    echo -e "  ${BOLD}Options:${RESET}"
+    echo -e "    -h, --help     Show this help message"
+    echo -e "    -v, --version  Show version"
+    echo -e ""
+}
+
+# ─── Version ─────────────────────────────────────────────────────────────────
+VERSION="1.0.0"
+
+# ─── Dependency check ────────────────────────────────────────────────────────
+check_deps() {
+    local missing=()
+
+    # curl is mandatory
+    if ! command -v curl &>/dev/null; then
+        missing+=("curl")
+    fi
+
+    # chafa is mandatory for terminal rendering
+    if ! command -v chafa &>/dev/null; then
+        missing+=("chafa")
+    fi
+
+    # Either ImageMagick (convert) or Python3+Pillow is needed for pin drawing
+    local has_image_tool=false
+    if command -v convert &>/dev/null; then
+        has_image_tool=true
+        USE_IMAGEMAGICK=true
+    elif command -v python3 &>/dev/null; then
+        if python3 -c "from PIL import Image, ImageDraw" 2>/dev/null; then
+            has_image_tool=true
+            USE_IMAGEMAGICK=false
+        fi
+    fi
+
+    if ! ${has_image_tool}; then
+        missing+=("imagemagick or python3-pillow")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        print_error "Missing dependencies: ${missing[*]}"
+        echo -e "  ${DIM}Run ./install.sh to install them.${RESET}" >&2
+        exit 1
+    fi
+}
+
+# ─── Validate input ──────────────────────────────────────────────────────────
+validate_input() {
+    local input="$1"
+    if [[ -z "${input}" ]]; then
+        print_error "No IP address or domain provided."
+        show_usage
+        exit 1
+    fi
+    if [[ "${input}" =~ [[:space:]] ]]; then
+        print_error "Invalid input: contains spaces."
+        exit 1
+    fi
+}
+
+# ─── Ensure map exists ──────────────────────────────────────────────────────
+ensure_map() {
+    if [[ ! -f "${MAP_FILE}" ]]; then
+        print_info "Map image not found. Downloading..."
+        mkdir -p "$(dirname "${MAP_FILE}")"
+        if ! curl -sL -o "${MAP_FILE}" "${MAP_URL}" -H "User-Agent: Mozilla/5.0"; then
+            print_error "Failed to download map image."
+            exit 1
+        fi
+        # Resize to proper equirectangular dimensions
+        if command -v convert &>/dev/null; then
+            convert "${MAP_FILE}" -resize 2048x1024! "${MAP_FILE}.tmp" 2>/dev/null && \
+                mv "${MAP_FILE}.tmp" "${MAP_FILE}"
+        elif command -v python3 &>/dev/null; then
+            python3 -c "
+from PIL import Image
+img = Image.open('${MAP_FILE}')
+img = img.resize((2048, 1024), Image.LANCZOS)
+img.save('${MAP_FILE}', 'PNG')
+" 2>/dev/null
+        fi
+        print_info "Map downloaded successfully."
+    fi
+}
+
+# ─── Resolve domain to IP ───────────────────────────────────────────────────
+resolve_ip() {
+    local input="$1"
+    if [[ "${input}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "${input}"
+        return
+    fi
+    local resolved
+    resolved=$(dig +short "${input}" A 2>/dev/null | head -1)
+    if [[ -z "${resolved}" ]]; then
+        resolved=$(host -t A "${input}" 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+    fi
+    if [[ -z "${resolved}" ]]; then
+        resolved=$(nslookup "${input}" 2>/dev/null | grep -oP 'Address:\s*\K\d+\.\d+\.\d+\.\d+' | tail -1)
+    fi
+    if [[ -z "${resolved}" ]]; then
+        print_error "Could not resolve domain: ${input}"
+        exit 1
+    fi
+    echo "${resolved}"
+}
+
+# ─── Query geolocation API ──────────────────────────────────────────────────
+query_geo() {
+    local ip="$1"
+    local json
+
+    json=$(curl -s "http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,regionName,city,lat,lon,query,isp" 2>/dev/null)
+
+    if [[ -z "${json}" ]]; then
+        print_error "No response from geolocation API. Check your connection."
+        exit 1
+    fi
+
+    local status
+    status=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    if [[ "${status}" == "fail" ]]; then
+        local msg
+        msg=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','Unknown error'))" 2>/dev/null || echo "Unknown error")
+        print_error "API error: ${msg}"
+        exit 1
+    fi
+
+    GEO_LAT=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lat',0))" 2>/dev/null || echo "0")
+    GEO_LON=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lon',0))" 2>/dev/null || echo "0")
+    GEO_COUNTRY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('country','Unknown'))" 2>/dev/null || echo "Unknown")
+    GEO_CITY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('city',''))" 2>/dev/null || echo "")
+    GEO_REGION=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('regionName',''))" 2>/dev/null || echo "")
+    GEO_ISP=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('isp',''))" 2>/dev/null || echo "")
+    GEO_QUERY=$(echo "${json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('query',''))" 2>/dev/null || echo "")
+}
+
+# ─── Draw pin on map (ImageMagick) ──────────────────────────────────────────
+draw_pin_imagemagick() {
+    local lat="${GEO_LAT}"
+    local lon="${GEO_LON}"
+    local map_width map_height
+
+    map_width=$(identify -format "%w" "${MAP_FILE}" 2>/dev/null || echo "2048")
+    map_height=$(identify -format "%h" "${MAP_FILE}" 2>/dev/null || echo "1024")
+
+    local x y
+    x=$(python3 -c "print(int((${lon} + 180) / 360 * ${map_width}))")
+    y=$(python3 -c "print(int((90 - ${lat}) / 180 * ${map_height}))")
+
+    x=$(python3 -c "print(max(0, min(${x}, ${map_width} - 1)))")
+    y=$(python3 -c "print(max(0, min(${y}, ${map_height} - 1)))")
+
+    local pin_size=$((map_width / 80))
+    [[ ${pin_size} -lt 8 ]] && pin_size=8
+    [[ ${pin_size} -gt 24 ]] && pin_size=24
+
+    local ring_size=$((pin_size * 2))
+    local ring_width=$((pin_size / 3))
+    [[ ${ring_width} -lt 2 ]] && ring_width=2
+
+    convert "${MAP_FILE}" \
+        \( +clone -fill "rgba(255,0,0,0.25)" -draw "circle ${x},${y} $((x + ring_size)),${y}" \) \
+        -compose over -composite \
+        -fill "none" -stroke "#FF0000" -strokewidth "${ring_width}" \
+        -draw "circle ${x},${y} $((x + pin_size)),${y}" \
+        -fill "#FF0000" -stroke none \
+        -draw "circle ${x},${y} $((x + pin_size / 2)),${y}" \
+        -fill "#FFFFFF" -stroke none \
+        -draw "circle ${x},${y} $((x + pin_size / 4)),${y}" \
+        "${MAP_WITH_PIN}" 2>/dev/null
+}
+
+# ─── Draw pin on map (Pillow fallback) ────────────────────────────────────────
+draw_pin_pillow() {
+    local lat="${GEO_LAT}"
+    local lon="${GEO_LON}"
+    local map_file="${MAP_FILE}"
+    local output="${MAP_WITH_PIN}"
+
+    python3 -c "
+from PIL import Image, ImageDraw
+import math
+
+lat = ${lat}
+lon = ${lon}
+
+img = Image.open('${map_file}')
+map_width, map_height = img.size
+
+# Equirectangular projection
+x = int((lon + 180) / 360 * map_width)
+y = int((90 - lat) / 180 * map_height)
+
+# Clamp to image bounds
+x = max(0, min(x, map_width - 1))
+y = max(0, min(y, map_height - 1))
+
+pin_size = max(8, min(map_width // 80, 24))
+ring_size = pin_size * 2
+ring_width = max(2, pin_size // 3)
+
+overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+draw = ImageDraw.Draw(overlay)
+
+# Outer glow (semi-transparent red)
+for i in range(3, 0, -1):
+    alpha = int(30 / i)
+    r = ring_size + i * 3
+    draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 0, 0, alpha))
+
+# Red ring
+for w in range(ring_width):
+    r = pin_size + w
+    draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 0, 0, 255))
+
+# Solid red center
+draw.ellipse([x - pin_size // 2, y - pin_size // 2, x + pin_size // 2, y + pin_size // 2],
+             fill=(255, 0, 0, 255))
+
+# White inner dot
+dot_r = pin_size // 4
+draw.ellipse([x - dot_r, y - dot_r, x + dot_r, y + dot_r], fill=(255, 255, 255, 255))
+
+# Composite onto original
+if img.mode != 'RGBA':
+    img = img.convert('RGBA')
+result = Image.alpha_composite(img, overlay)
+result.save('${output}', 'PNG')
+" 2>/dev/null
+}
+
+# ─── Draw pin on map (dispatcher) ────────────────────────────────────────────
+draw_pin() {
+    if ${USE_IMAGEMAGICK:-false}; then
+        draw_pin_imagemagick
+    else
+        draw_pin_pillow
+    fi
+
+    if [[ ! -f "${MAP_WITH_PIN}" ]]; then
+        print_error "Failed to render pin on map."
+        exit 1
+    fi
+}
+
+# ─── Render map in terminal ─────────────────────────────────────────────────
+render_map() {
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo "80")
+
+    local chafa_width=$((term_width))
+    [[ ${chafa_width} -lt 40 ]] && chafa_width=40
+    [[ ${chafa_width} -gt 200 ]] && chafa_width=200
+
+    chafa "${MAP_WITH_PIN}" \
+        --size="${chafa_width}x" \
+        --symbols block+half+vhalf+space \
+        --colors 256 \
+        --dither ordered \
+        --optimize 9 \
+        2>/dev/null
+}
+
+# ─── Display results ────────────────────────────────────────────────────────
+display_results() {
+    local location_parts=()
+    [[ -n "${GEO_CITY}" ]] && location_parts+=("${GEO_CITY}")
+    [[ -n "${GEO_REGION}" ]] && location_parts+=("${GEO_REGION}")
+    location_parts+=("${GEO_COUNTRY}")
+    local location
+    location=$(IFS=, ; echo "${location_parts[*]}" | sed 's/,/, /g')
+
+    local lat_dir="N" lon_dir="E"
+    python3 -c "exit(0 if ${GEO_LAT} < 0 else 1)" 2>/dev/null && lat_dir="S"
+    python3 -c "exit(0 if ${GEO_LON} < 0 else 1)" 2>/dev/null && lon_dir="W"
+
+    local lat_abs lon_abs
+    lat_abs=$(python3 -c "print(abs(${GEO_LAT}))")
+    lon_abs=$(python3 -c "print(abs(${GEO_LON}))")
+
+    echo -e ""
+    echo -e "  ${BOLD}┌─────────────────────────────────────────────┐${RESET}"
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}IP:${RESET}          ${GREEN}${GEO_QUERY}${RESET}"
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}Location:${RESET}    ${GREEN}${location}${RESET}"
+    echo -e "  ${BOLD}│${RESET}  ${WHITE}Coordinates:${RESET} ${GREEN}${lat_abs}°${lat_dir}, ${lon_abs}°${lon_dir}${RESET}"
+    if [[ -n "${GEO_ISP}" ]]; then
+        echo -e "  ${BOLD}│${RESET}  ${WHITE}ISP:${RESET}        ${DIM}${GEO_ISP}${RESET}"
+    fi
+    echo -e "  ${BOLD}└─────────────────────────────────────────────┘${RESET}"
+    echo -e ""
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+    case "${1:-}" in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "geo-cli v${VERSION}"
+            exit 0
+            ;;
+        "")
+            print_error "No IP address or domain provided."
+            show_usage
+            exit 1
+            ;;
+    esac
+
+    local input="$1"
+
+    show_banner
+    check_deps
+    validate_input "${input}"
+
+    local ip
+    ip=$(resolve_ip "${input}")
+    if [[ "${input}" != "${ip}" ]]; then
+        print_info "Resolved ${input} → ${ip}"
+    fi
+
+    print_info "Querying geolocation..."
+    query_geo "${ip}"
+
+    ensure_map
+
+    print_info "Rendering map..."
+    draw_pin
+
+    clear 2>/dev/null || true
+
+    show_banner
+    display_results
+
+    render_map
+
+    echo -e ""
+}
+
+main "$@"
