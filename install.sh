@@ -8,6 +8,7 @@ set -euo pipefail
 # ─── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[1;31m'
 GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
 CYAN='\033[1;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -183,7 +184,15 @@ main() {
         echo -e ""
         print_info "chafa not found in repos. Building from source..."
         local chafa_tmp
-        chafa_tmp="$(mktemp -d /tmp/chafa-build.XXXXXX)"
+        local _tmp_base
+        if [[ -n "${TMPDIR:-}" ]]; then
+            _tmp_base="${TMPDIR}"
+        elif [[ -d "/tmp" && -w "/tmp" ]]; then
+            _tmp_base="/tmp"
+        else
+            _tmp_base="${SCRIPT_DIR}"
+        fi
+        chafa_tmp="$(mktemp -d "${_tmp_base}/chafa-build.XXXXXX")"
 
         if command -v git &>/dev/null && command -v gcc &>/dev/null && command -v make &>/dev/null; then
             # Determine install prefix based on environment
@@ -248,7 +257,7 @@ img.save('${SCRIPT_DIR}/assets/world_map.png', 'PNG')
     fi
 
     echo -e ""
-    if ${all_ok} && command -v chafa &>/dev/null && command -v convert &>/dev/null; then
+    if ${all_ok} && command -v chafa &>/dev/null && { command -v convert &>/dev/null || command -v magick &>/dev/null; }; then
         echo -e "  ${GREEN}${BOLD}All dependencies satisfied!${RESET}"
         echo -e ""
         echo -e "  ${BOLD}Usage:${RESET}  ./geo-cli 8.8.8.8"
